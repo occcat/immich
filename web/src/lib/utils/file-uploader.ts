@@ -15,7 +15,7 @@ import { uploadManager } from '$lib/managers/upload-manager.svelte';
 import { addAssetsToAlbums } from '$lib/services/album.service';
 import { uploadAssetsStore } from '$lib/stores/upload';
 import { UploadState } from '$lib/types';
-import { uploadRequest } from '$lib/utils';
+import { sendRequest, uploadRequest } from '$lib/utils';
 import { ExecutorQueue } from '$lib/utils/executor-queue';
 import { asQueryString } from '$lib/utils/shared-links';
 import { handleError } from './handle-error';
@@ -146,6 +146,158 @@ type FileUploaderParams = {
   deviceAssetId: string;
 };
 
+const MIN_UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024;
+
+type UploadBody = { id?: string; status?: AssetMediaStatus; isTrashed?: boolean };
+
+const quoteStructured = (value: string) => `"${value.replaceAll('\\', '\\\\').replaceAll('"', String.raw`\"`)}"`;
+
+const hexToBase64 = (hex: string) => {
+  const bytes = hex.match(/.{2}/g)?.map((byte) => Number.parseInt(byte, 16)) ?? [];
+  return btoa(bytes.map((byte) => String.fromCodePoint(byte)).join(''));
+};
+
+const readMaxAppendSize = async (uploadUrl: string) => {
+  try {
+    const response = await sendRequest<unknown>({ url: uploadUrl, method: 'OPTIONS' });
+    if (!response.ok) {
+      return undefined;
+    }
+    const match = /(?:^|,\s*)max-append-size=(\d+)/.exec(response.headers['upload-limit'] ?? '');
+    const limit = match ? Number(match[1]) : 0;
+    return limit > 0 ? limit : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const uploadWithRufh = async ({
+  assetFile,
+  deviceAssetId,
+  fileCreatedAt,
+  checksum,
+  onProgress,
+}: {
+  assetFile: File;
+  deviceAssetId: string;
+  fileCreatedAt: string;
+  checksum?: string;
+  onProgress: (loaded: number, total: number) => void;
+}): Promise<UploadBody | undefined> => {
+  if (assetFile.size <= MIN_UPLOAD_CHUNK_BYTES) {
+    return undefined;
+  }
+
+  const query = asQueryString(authManager.params);
+  const withQuery = (url: string) => (query ? `${url}${url.includes('?') ? '&' : '?'}${query}` : url);
+  const uploadUrl = withQuery(getBaseUrl() + '/upload');
+  let chunkSize = await readMaxAppendSize(uploadUrl);
+  if (!chunkSize || assetFile.size <= chunkSize) {
+    return undefined;
+  }
+
+  const digest = hexToBase64(checksum ?? (await hashFile(assetFile)));
+  const assetData = [
+    `device-asset-id=${quoteStructured(deviceAssetId)}`,
+    `device-id=${quoteStructured('web')}`,
+    `filename=${quoteStructured(assetFile.name)}`,
+    `file-created-at=${quoteStructured(fileCreatedAt)}`,
+    `file-modified-at=${quoteStructured(fileCreatedAt)}`,
+    'is-favorite=?0',
+  ].join(', ');
+
+  let offset = 0;
+  let location = uploadUrl;
+  let stalls = 0;
+  const size = assetFile.size;
+
+  while (offset < size) {
+    const end = Math.min(offset + chunkSize, size);
+    const complete = end === size;
+    const headers: Record<string, string> = {
+      'Upload-Draft-Interop-Version': '6',
+      'Upload-Complete': complete ? '?1' : '?0',
+      'Upload-Length': String(size),
+      'Content-Type': offset === 0 ? 'application/octet-stream' : 'application/partial-upload',
+    };
+    if (offset === 0) {
+      headers['Repr-Digest'] = `sha=:${digest}:`;
+      headers['x-immich-asset-data'] = assetData;
+    } else {
+      headers['Upload-Offset'] = String(offset);
+    }
+
+    let response: Awaited<ReturnType<typeof sendRequest<UploadBody>>>;
+    try {
+      response = await sendRequest<UploadBody>({
+        url: location,
+        method: offset === 0 ? 'POST' : 'PATCH',
+        headers,
+        data: assetFile.slice(offset, end),
+        onUploadProgress: (event) => onProgress(offset + event.loaded, size),
+      });
+    } catch {
+      stalls += 1;
+      if (stalls > 5) {
+        throw new Error('Upload interrupted');
+      }
+      continue;
+    }
+
+    if (response.status === 413) {
+      const match = /(?:^|,\s*)max-append-size=(\d+)/.exec(response.headers['upload-limit'] ?? '');
+      const serverMax = match ? Number(match[1]) : 0;
+      const next =
+        serverMax > 0 && serverMax < chunkSize
+          ? serverMax
+          : Math.max(MIN_UPLOAD_CHUNK_BYTES, Math.floor(chunkSize / 2));
+      if (next >= end - offset) {
+        throw new Error('Upload chunk exceeds the server limit');
+      }
+      chunkSize = next;
+      continue;
+    }
+
+    if (response.status === 409) {
+      const serverOffset = Number(response.headers['upload-offset']);
+      if (!Number.isSafeInteger(serverOffset) || serverOffset === offset) {
+        stalls += 1;
+        if (stalls > 5) {
+          throw new Error('Upload offset did not advance');
+        }
+        continue;
+      }
+      offset = serverOffset;
+      stalls = 0;
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error('Unable to upload file');
+    }
+
+    stalls = 0;
+    if (response.data.id && (complete || response.data.status)) {
+      onProgress(size, size);
+      return {
+        id: response.data.id,
+        status: response.data.status ?? AssetMediaStatus.Created,
+        isTrashed: response.data.isTrashed,
+      };
+    }
+
+    const nextLocation = response.headers.location;
+    if (offset === 0 && nextLocation) {
+      location = withQuery(new URL(nextLocation, globalThis.location.origin).href);
+    }
+    const reportedOffset = Number(response.headers['upload-offset']);
+    offset = Number.isSafeInteger(reportedOffset) ? reportedOffset : end;
+    onProgress(offset, size);
+  }
+
+  throw new Error('Upload did not finish');
+};
+
 // TODO: should probably use the @api SDK
 async function fileUploader({
   assetFile,
@@ -175,11 +327,12 @@ async function fileUploader({
     }
 
     let responseData: { id: string; status: AssetMediaStatus; isTrashed?: boolean } | undefined;
+    let checksum: string | undefined;
     if (!authManager.isSharedLink) {
       uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_hashing') });
       await tick();
       try {
-        const checksum = await hashFile(assetFile);
+        checksum = await hashFile(assetFile);
 
         const {
           results: [checkUploadResult],
@@ -197,9 +350,25 @@ async function fileUploader({
     }
 
     if (!responseData) {
-      const queryParams = asQueryString(authManager.params);
-
       uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_uploading') });
+      const chunked = await uploadWithRufh({
+        assetFile,
+        deviceAssetId,
+        fileCreatedAt,
+        checksum,
+        onProgress: (loaded, total) => uploadAssetsStore.updateProgress(deviceAssetId, loaded, total),
+      });
+      if (chunked?.id) {
+        responseData = {
+          id: chunked.id,
+          status: chunked.status ?? AssetMediaStatus.Created,
+          isTrashed: chunked.isTrashed,
+        };
+      }
+    }
+
+    if (!responseData) {
+      const queryParams = asQueryString(authManager.params);
       const response = await uploadRequest<AssetMediaResponseDto>({
         url: getBaseUrl() + '/assets' + (queryParams ? `?${queryParams}` : ''),
         data: formData,
