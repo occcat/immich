@@ -19799,10 +19799,17 @@
             "maximum": 9007199254740991,
             "minimum": 1,
             "type": "integer"
+          },
+          "maxAppendBytes": {
+            "description": "Maximum bytes accepted in one resumable upload request",
+            "maximum": 94371840,
+            "minimum": 5242880,
+            "type": "integer"
           }
         },
         "required": [
-          "maxAgeHours"
+          "maxAgeHours",
+          "maxAppendBytes"
         ],
         "type": "object"
       },

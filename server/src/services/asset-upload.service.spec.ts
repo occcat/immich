@@ -6,6 +6,23 @@ import { authStub } from 'test/fixtures/auth.stub.js';
 import { factory } from 'test/small.factory.js';
 import { newTestService, ServiceMocks } from 'test/utils.js';
 
+const uploadLimitResponse = () => {
+  const headers = new Map<string, string>();
+  const res = {
+    headers,
+    status: vi.fn(),
+    setHeader: vi.fn((name: string, value: string) => {
+      headers.set(name, value);
+      return res;
+    }),
+    contentType: vi.fn(),
+    send: vi.fn(),
+  };
+  res.status.mockReturnValue(res);
+  res.contentType.mockReturnValue(res);
+  return res;
+};
+
 describe(AssetUploadService.name, () => {
   let sut: AssetUploadService;
   let mocks: ServiceMocks;
@@ -450,6 +467,38 @@ describe(AssetUploadService.name, () => {
 
       expect(result).toBe(JobStatus.Success);
       expect(mocks.asset.removeAndDecrementQuota).toHaveBeenCalledWith(assetId);
+    });
+  });
+
+  describe('max-append-size', () => {
+    it('advertises the append ceiling on OPTIONS', async () => {
+      const res = uploadLimitResponse();
+
+      await sut.getUploadOptions(res as never);
+
+      expect(res.headers.get('Upload-Limit')).toBe('min-size=1, max-append-size=94371840, max-age=259200');
+    });
+
+    it('refuses an append larger than the ceiling before creating an asset', async () => {
+      const res = uploadLimitResponse();
+      const req = { destroy: vi.fn() };
+
+      await sut.startUpload(
+        authStub.user1,
+        req as never,
+        res as never,
+        {
+          contentLength: 94_371_841,
+          uploadLength: 94_371_841,
+          uploadComplete: false,
+          version: 6,
+        } as never,
+      );
+
+      expect(res.status).toHaveBeenCalledWith(413);
+      expect(res.headers.get('Upload-Limit')).toContain('max-append-size=94371840');
+      expect(req.destroy).toHaveBeenCalled();
+      expect(mocks.asset.createWithMetadata).not.toHaveBeenCalled();
     });
   });
 });
