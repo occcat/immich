@@ -65,6 +65,8 @@ export type AdminConfigDatabaseBackupDto = {
 export type AdminConfigUploadBackupDto = {
     /** Max age in hours */
     maxAgeHours: number;
+    /** Maximum bytes accepted in one resumable upload request */
+    maxAppendBytes: number;
 };
 export type AdminConfigBackupsDto = {
     database: AdminConfigDatabaseBackupDto;

@@ -19,7 +19,7 @@ import { MultiBar, Presets, SingleBar } from 'cli-progress';
 import { chunk } from 'lodash-es';
 import micromatch from 'micromatch';
 import { Stats, createReadStream, existsSync } from 'node:fs';
-import { stat, unlink } from 'node:fs/promises';
+import { open, stat, unlink } from 'node:fs/promises';
 import path, { basename } from 'node:path';
 import { Queue } from 'src/queue.js';
 import { BaseOptions, Batcher, authenticate, crawl, requirePermissions, s, sha1 } from 'src/utils.js';
@@ -398,11 +398,143 @@ export const uploadFiles = async (files: string[], options: UploadOptionsDto): P
   return newAssets;
 };
 
+const MIN_UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024;
+
+const parseMaxAppendSize = (header: string | null) => {
+  const match = /(?:^|,\s*)max-append-size=(\d+)/.exec(header ?? '');
+  const limit = match ? Number(match[1]) : 0;
+  return limit > 0 ? limit : undefined;
+};
+
+const quoteStructured = (value: string) => `"${value.replaceAll('\\', '\\\\').replaceAll('"', String.raw`\"`)}"`;
+
+const readSlice = async (input: string, start: number, length: number) => {
+  const handle = await open(input, 'r');
+  try {
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, start);
+    return buffer;
+  } finally {
+    await handle.close();
+  }
+};
+
+const uploadWithRufh = async (input: string, stats: Stats): Promise<AssetMediaResponseDto | undefined> => {
+  if (stats.size <= MIN_UPLOAD_CHUNK_BYTES) {
+    return undefined;
+  }
+
+  const { baseUrl, headers } = defaults;
+  const requestHeaders = { ...(headers as Record<string, string>) };
+  const probe = await fetch(`${baseUrl}/upload`, { method: 'OPTIONS', headers: requestHeaders });
+  if (!probe.ok) {
+    return undefined;
+  }
+
+  let chunkSize = parseMaxAppendSize(probe.headers.get('upload-limit'));
+  if (!chunkSize || stats.size <= chunkSize) {
+    return undefined;
+  }
+
+  if (findSidecar(input)) {
+    console.warn(`Skipping sidecar for ${input}; resumable upload stores the media file only`);
+  }
+
+  const digest = Buffer.from(await sha1(input), 'hex').toString('base64');
+  const createdAt = stats.mtime.toISOString();
+  const assetData = [
+    `device-asset-id=${quoteStructured(input)}`,
+    `device-id=${quoteStructured('cli')}`,
+    `filename=${quoteStructured(basename(input))}`,
+    `file-created-at=${quoteStructured(createdAt)}`,
+    `file-modified-at=${quoteStructured(createdAt)}`,
+    'is-favorite=?0',
+  ].join(', ');
+
+  let offset = 0;
+  let url = `${baseUrl}/upload`;
+  let stalls = 0;
+
+  while (offset < stats.size) {
+    const length = Math.min(chunkSize, stats.size - offset);
+    const isComplete = offset + length === stats.size;
+    const sliceHeaders: Record<string, string> = {
+      ...requestHeaders,
+      'upload-draft-interop-version': '6',
+      'upload-complete': isComplete ? '?1' : '?0',
+      'upload-length': String(stats.size),
+      'content-type': offset === 0 ? 'application/octet-stream' : 'application/partial-upload',
+    };
+    if (offset === 0) {
+      sliceHeaders['repr-digest'] = `sha=:${digest}:`;
+      sliceHeaders['x-immich-asset-data'] = assetData;
+    } else {
+      sliceHeaders['upload-offset'] = String(offset);
+    }
+
+    const response = await fetch(url, {
+      method: offset === 0 ? 'POST' : 'PATCH',
+      headers: sliceHeaders,
+      body: await readSlice(input, offset, length),
+    });
+
+    if (response.status === 413) {
+      const serverMax = parseMaxAppendSize(response.headers.get('upload-limit')) ?? 0;
+      const next =
+        serverMax > 0 && serverMax < chunkSize
+          ? serverMax
+          : Math.max(MIN_UPLOAD_CHUNK_BYTES, Math.floor(chunkSize / 2));
+      if (next >= length) {
+        throw new Error(await response.text());
+      }
+      chunkSize = next;
+      continue;
+    }
+
+    if (response.status === 409) {
+      const serverOffset = Number(response.headers.get('upload-offset'));
+      if (!Number.isSafeInteger(serverOffset) || serverOffset === offset) {
+        stalls += 1;
+        if (stalls > 5) {
+          throw new Error(await response.text());
+        }
+        continue;
+      }
+      offset = serverOffset;
+      stalls = 0;
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+
+    stalls = 0;
+    if (isComplete || response.status === 200) {
+      return (await response.json()) as AssetMediaResponseDto;
+    }
+
+    const location = response.headers.get('location');
+    if (offset === 0 && location) {
+      url = new URL(location, baseUrl).href;
+    }
+    const serverOffset = Number(response.headers.get('upload-offset'));
+    offset = Number.isSafeInteger(serverOffset) ? serverOffset : offset + length;
+  }
+
+  throw new Error(`Upload did not finish for ${input}`);
+};
+
 const uploadFile = async (
   input: string,
   stats: Stats,
   { visibility }: UploadOptionsDto,
 ): Promise<AssetMediaResponseDto> => {
+  const resumable = await uploadWithRufh(input, stats);
+  if (resumable) {
+    return resumable;
+  }
+
   const { baseUrl, headers } = defaults;
 
   const formData = new FormData();

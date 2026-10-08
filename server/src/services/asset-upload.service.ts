@@ -61,6 +61,9 @@ export class AssetUploadService extends BaseService {
     const isComplete = uploadComplete !== false;
     const isResumable = version && uploadComplete !== undefined;
     const { backup } = await this.getConfig({ withCache: true });
+    if (this.rejectOversizedAppend(req, res, contentLength, backup)) {
+      return;
+    }
 
     const { id, path, status, isDuplicate } = await this.onStart(auth, dto);
     const location = `/api/upload/${id}`;
@@ -123,9 +126,13 @@ export class AssetUploadService extends BaseService {
     });
   }
 
-  resumeUpload(auth: AuthDto, req: Readable, res: Response, id: string, dto: ResumeUploadDto): Promise<void> {
+  async resumeUpload(auth: AuthDto, req: Readable, res: Response, id: string, dto: ResumeUploadDto): Promise<void> {
     this.logger.verboseFn(() => `Resuming upload for ${id}: ${JSON.stringify(dto)}`);
     const { uploadComplete, uploadLength, uploadOffset, contentLength, version } = dto;
+    const { backup } = await this.getConfig({ withCache: true });
+    if (this.rejectOversizedAppend(req, res, contentLength, backup)) {
+      return;
+    }
     this.setCompleteHeader(res, version, false);
     this.addRequest(id, req);
     return this.databaseRepository.withUuidLock(id, async () => {
@@ -460,6 +467,29 @@ export class AssetUploadService extends BaseService {
   }
 
   private getUploadLimits({ upload }: SystemConfig['backup']) {
-    return `min-size=1, max-age=${upload.maxAgeHours * 3600}`;
+    return `min-size=1, max-append-size=${upload.maxAppendBytes}, max-age=${upload.maxAgeHours * 3600}`;
+  }
+
+  private rejectOversizedAppend(
+    req: Readable,
+    res: Response,
+    contentLength: number,
+    backup: SystemConfig['backup'],
+  ): boolean {
+    if (contentLength <= backup.upload.maxAppendBytes) {
+      return false;
+    }
+
+    res
+      .status(413)
+      .setHeader('Upload-Limit', this.getUploadLimits(backup))
+      .contentType('application/problem+json')
+      .send({
+        type: 'about:blank',
+        title: 'upload append exceeds max-append-size',
+        maxAppendSize: backup.upload.maxAppendBytes,
+      });
+    req.destroy();
+    return true;
   }
 }

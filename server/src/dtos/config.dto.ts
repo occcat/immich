@@ -33,6 +33,10 @@ import {
   VideoContainerSchema,
 } from 'src/enum.js';
 
+export const DEFAULT_UPLOAD_MAX_APPEND_BYTES = 90 * 1024 * 1024;
+export const MIN_UPLOAD_MAX_APPEND_BYTES = 5 * 1024 * 1024;
+export const MAX_UPLOAD_MAX_APPEND_BYTES = DEFAULT_UPLOAD_MAX_APPEND_BYTES;
+
 const { Admin, User, Public } = ConfigVisibility;
 
 const configBool = z
@@ -161,6 +165,11 @@ const AdminConfigSchemaWithVisibility = z
         upload: z
           .object({
             maxAgeHours: z.int().min(1).describe('Max age in hours'),
+            maxAppendBytes: z
+              .int()
+              .min(MIN_UPLOAD_MAX_APPEND_BYTES)
+              .max(MAX_UPLOAD_MAX_APPEND_BYTES)
+              .describe('Maximum bytes accepted in one resumable upload request'),
           })
           .meta({ id: 'AdminConfigUploadBackupDto' }),
       })
@@ -558,6 +567,7 @@ export const defaults = Object.freeze<SystemConfig>({
     },
     upload: {
       maxAgeHours: 72,
+      maxAppendBytes: DEFAULT_UPLOAD_MAX_APPEND_BYTES,
     },
   },
   ffmpeg: {

@@ -133,6 +133,7 @@ In some cases, proxies cache requests to disk before passing them on, and if dis
 
 If you are using Cloudflare Tunnel, please know that they set a maximum filesize of 100 MB that cannot be changed.
 At times, files larger than this may work, potentially up to 1 GB. However, the official limit is 100 MB.
+Resumable upload clients read `Upload-Limit: max-append-size` and keep each request at or below `backup.upload.maxAppendBytes` (default 90 MiB).
 If you are having issues, we recommend switching to a different network deployment.
 
 ### Why are some photos stored in the file system with the wrong date?

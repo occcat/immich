@@ -280,6 +280,10 @@ export class QueueService extends BaseService {
       );
     }
 
+    if (config.nightlyTasks.removeStaleUploads) {
+      jobs.push({ name: JobName.PartialAssetCleanupQueueAll });
+    }
+
     if (config.nightlyTasks.generateMemories) {
       jobs.push({ name: JobName.MemoryGenerate });
     }
