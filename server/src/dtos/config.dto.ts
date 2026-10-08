@@ -2,6 +2,11 @@ import { CronExpression } from '@nestjs/schedule';
 import { validateCronExpression } from 'cron';
 import { createZodDto } from 'nestjs-zod';
 import z from 'zod';
+
+/** Stays under the Cloudflare free-tier request cap. Clients may send a smaller append. */
+export const DEFAULT_UPLOAD_MAX_APPEND_BYTES = 90 * 1024 * 1024;
+export const MIN_UPLOAD_MAX_APPEND_BYTES = 5 * 1024 * 1024;
+export const MAX_UPLOAD_MAX_APPEND_BYTES = DEFAULT_UPLOAD_MAX_APPEND_BYTES;
 import type { DeepPartial } from 'src/types.js';
 import {
   AudioCodec,
@@ -158,6 +163,16 @@ const AdminConfigSchemaWithVisibility = z
             keepLastAmount: z.int().min(1).describe('Keep last amount'),
           })
           .meta({ id: 'AdminConfigDatabaseBackupDto' }),
+        upload: z
+          .object({
+            maxAgeHours: z.int().min(1).describe('Max age in hours'),
+            maxAppendBytes: z
+              .int()
+              .min(MIN_UPLOAD_MAX_APPEND_BYTES)
+              .max(MAX_UPLOAD_MAX_APPEND_BYTES)
+              .describe('Maximum bytes accepted in one resumable upload request'),
+          })
+          .meta({ id: 'AdminConfigUploadBackupDto' }),
       })
       .meta({ id: 'AdminConfigBackupsDto' }),
     ffmpeg: AdminConfigFFmpegSchema,
@@ -364,6 +379,7 @@ const AdminConfigSchemaWithVisibility = z
         clusterNewFaces: configBool.describe('Cluster new faces'),
         generateMemories: configBool.describe('Generate memories'),
         syncQuotaUsage: configBool.describe('Sync quota usage'),
+        removeStaleUploads: configBool.describe('Remove stale uploads'),
       })
       .meta({ id: 'AdminConfigNightlyTasksDto' }),
     trash: z
@@ -550,6 +566,10 @@ export const defaults = Object.freeze<SystemConfig>({
       cronExpression: CronExpression.EVERY_DAY_AT_2AM,
       keepLastAmount: 14,
     },
+    upload: {
+      maxAgeHours: 72,
+      maxAppendBytes: DEFAULT_UPLOAD_MAX_APPEND_BYTES,
+    },
   },
   ffmpeg: {
     crf: 23,
@@ -725,6 +745,7 @@ export const defaults = Object.freeze<SystemConfig>({
     syncQuotaUsage: true,
     missingThumbnails: true,
     clusterNewFaces: true,
+    removeStaleUploads: true,
   },
   trash: {
     enabled: true,

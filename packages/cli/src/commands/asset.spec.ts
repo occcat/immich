@@ -123,6 +123,103 @@ describe('uploadFiles', () => {
     const formData = fetchMocker.mock.calls[0]?.[1]?.body as FormData;
     expect(formData.get('visibility')).toBe('hidden');
   });
+
+  it('sends files above the advertised append ceiling as resumable slices', async () => {
+    const bigPath = path.join(testDir, 'big.mp4');
+    const size = 6_000_000;
+    const limit = 5_242_880;
+    fs.writeFileSync(bigPath, Buffer.alloc(size, 7));
+
+    const slices: { method: string; length: number; complete: string | null }[] = [];
+    fetchMocker.doMockIf(/\/upload/, async (request) => {
+      if (request.method === 'OPTIONS') {
+        return {
+          status: 204,
+          headers: { 'upload-limit': `min-size=1, max-append-size=${limit}, max-age=259200` },
+        };
+      }
+
+      const bytes = await request.arrayBuffer();
+      slices.push({
+        method: request.method,
+        length: bytes.byteLength,
+        complete: request.headers.get('upload-complete'),
+      });
+      if (request.method === 'POST') {
+        return {
+          status: 201,
+          headers: {
+            location: `${baseUrl}/upload/asset-1`,
+            'upload-offset': String(bytes.byteLength),
+          },
+        };
+      }
+
+      return {
+        status: 200,
+        headers: { 'upload-offset': String(size) },
+        body: JSON.stringify({ id: 'asset-1', status: 'created' }),
+      };
+    });
+
+    await expect(uploadFiles([bigPath], { concurrency: 1 })).resolves.toEqual([{ filepath: bigPath, id: 'asset-1' }]);
+
+    expect(slices.map((slice) => slice.method)).toEqual(['POST', 'PATCH']);
+    expect(slices[0]).toMatchObject({ length: limit, complete: '?0' });
+    expect(slices[1]).toMatchObject({ length: size - limit, complete: '?1' });
+    expect(slices.every((slice) => slice.length <= limit)).toBe(true);
+  });
+
+  it('shrinks the next append when the server answers 413', async () => {
+    const bigPath = path.join(testDir, 'bigger.mp4');
+    const size = 8_000_000;
+    const advertised = 6_000_000;
+    const enforced = 5_242_880;
+    fs.writeFileSync(bigPath, Buffer.alloc(size, 3));
+
+    let posts = 0;
+    const lengths: number[] = [];
+    fetchMocker.doMockIf(/\/upload/, async (request) => {
+      if (request.method === 'OPTIONS') {
+        return {
+          status: 204,
+          headers: { 'upload-limit': `min-size=1, max-append-size=${advertised}, max-age=259200` },
+        };
+      }
+
+      const bytes = await request.arrayBuffer();
+      lengths.push(bytes.byteLength);
+      if (request.method === 'POST' && posts++ === 0) {
+        return {
+          status: 413,
+          headers: { 'upload-limit': `min-size=1, max-append-size=${enforced}, max-age=259200` },
+        };
+      }
+      if (request.method === 'POST') {
+        return {
+          status: 201,
+          headers: {
+            location: `${baseUrl}/upload/asset-2`,
+            'upload-offset': String(bytes.byteLength),
+          },
+        };
+      }
+
+      const offset = Number(request.headers.get('upload-offset'));
+      if (offset + bytes.byteLength < size) {
+        return { status: 204, headers: { 'upload-offset': String(offset + bytes.byteLength) } };
+      }
+      return {
+        status: 200,
+        headers: { 'upload-offset': String(size) },
+        body: JSON.stringify({ id: 'asset-2', status: 'created' }),
+      };
+    });
+
+    await expect(uploadFiles([bigPath], { concurrency: 1 })).resolves.toEqual([{ filepath: bigPath, id: 'asset-2' }]);
+    expect(lengths[0]).toBe(advertised);
+    expect(lengths.slice(1).every((length) => length <= enforced)).toBe(true);
+  });
 });
 
 describe('checkForDuplicates', () => {

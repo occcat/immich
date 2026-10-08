@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:background_downloader/background_downloader.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:freezed_annotation/freezed_annotation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -199,6 +200,11 @@ class BackgroundUploadService {
   }
 
   Future<void> _handleTaskStatusUpdate(TaskStatusUpdate update) async {
+    if (_isRufh(update.task.metaData)) {
+      await _handleRufhUpdate(update);
+      return;
+    }
+
     switch (update.status) {
       case TaskStatus.complete:
         unawaited(_handleLivePhoto(update));
@@ -409,6 +415,39 @@ class BackgroundUploadService {
     final headers = ApiService.getRequestHeaders();
     final deviceId = Store.get(StoreKey.deviceId);
     final (baseDirectory, directory, filename) = await Task.split(filePath: file.path);
+    final length = _fileLength(file);
+    if (length != null && length > kUploadChunkFloorBytes) {
+      final limit = await _uploadRepository.maxAppendBytes();
+      if (limit != null && length > limit) {
+        final digest = base64Encode((await sha1.bind(file.openRead()).first).bytes);
+        return _rufhUploadTask(
+          fileLength: length,
+          chunkSize: limit,
+          checksum: digest,
+          offset: 0,
+          url: Uri.parse('$serverEndpoint/upload').toString(),
+          baseDirectory: baseDirectory,
+          directory: directory,
+          filename: filename,
+          originalFileName: originalFileName,
+          deviceAssetId: deviceAssetId,
+          metadata: metadata,
+          group: group,
+          priority: priority,
+          requiresWiFi: requiresWiFi,
+          fields: {
+            'filename': originalFileName ?? filename,
+            'deviceAssetId': deviceAssetId ?? '',
+            'deviceId': deviceId,
+            'fileCreatedAt': createdAt.toUtc().toIso8601String(),
+            'fileModifiedAt': modifiedAt.toUtc().toIso8601String(),
+            'isFavorite': isFavorite?.toString() ?? 'false',
+            if (cloudId != null && cloudId.isNotEmpty) 'icloudId': cloudId,
+            ...?fields,
+          },
+        );
+      }
+    }
     final fieldsMap = {
       'filename': originalFileName ?? filename,
       // deviceAssetId/deviceId required by server v2.7.5 and below (drop in v4.0 per #27818).
@@ -452,5 +491,239 @@ class BackgroundUploadService {
       updates: Updates.statusAndProgress,
       retries: 3,
     );
+  }
+
+  int? _fileLength(File file) {
+    try {
+      return file.lengthSync();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _isRufh(String metadata) {
+    if (metadata.isEmpty) {
+      return false;
+    }
+    try {
+      final decoded = json.decode(metadata);
+      return decoded is Map && decoded['uploadPhase'] == 'rufh';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _handleRufhUpdate(TaskStatusUpdate update) async {
+    final task = update.task;
+    if (task is! UploadTask) {
+      return;
+    }
+    final meta = Map<String, dynamic>.from(json.decode(task.metaData) as Map);
+    final size = (meta['uploadSize'] as num).toInt();
+    var offset = (meta['uploadOffset'] as num).toInt();
+    var chunkSize = (meta['uploadChunkSize'] as num).toInt();
+    final attempts = (meta['uploadAttempts'] as num?)?.toInt() ?? 0;
+    final willComplete = meta['uploadComplete'] == true;
+
+    if (update.status == TaskStatus.complete && willComplete) {
+      unawaited(_handleLivePhoto(update));
+      unawaited(_stackEditedAsset(update));
+      if (CurrentPlatform.isIOS) {
+        try {
+          await File(await task.filePath()).delete();
+        } catch (error) {
+          _logger.severe('Error deleting file path for iOS: $error');
+        }
+      }
+      return;
+    }
+
+    if (update.status == TaskStatus.failed) {
+      if (attempts >= 5) {
+        _logger.warning('Resumable upload stopped after repeated failures');
+        return;
+      }
+      final code = update.responseStatusCode;
+      if (code == 413) {
+        final serverMax = _maxAppendSize(update.responseHeaders?['upload-limit']);
+        final halved = chunkSize ~/ 2 < kUploadChunkFloorBytes ? kUploadChunkFloorBytes : chunkSize ~/ 2;
+        final next = serverMax != null && serverMax < chunkSize ? serverMax : halved;
+        if (next >= chunkSize && offset + chunkSize <= size) {
+          return;
+        }
+        chunkSize = next;
+      } else if (code == 409) {
+        final serverOffset = int.tryParse(update.responseHeaders?['upload-offset'] ?? '');
+        if (serverOffset != null) {
+          offset = serverOffset;
+        }
+      }
+      meta['uploadAttempts'] = attempts + 1;
+    } else if (update.status == TaskStatus.complete) {
+      final location = update.responseHeaders?['location'];
+      if (location != null && location.isNotEmpty && offset == 0) {
+        meta['uploadUrl'] = _resolveLocation(task.url, location).toString();
+      }
+      final serverOffset = int.tryParse(update.responseHeaders?['upload-offset'] ?? '');
+      offset = serverOffset ?? offset + chunkSize;
+      if (offset > size) {
+        offset = size;
+      }
+      meta['uploadAttempts'] = 0;
+    } else {
+      return;
+    }
+
+    if (offset >= size) {
+      return;
+    }
+
+    meta['uploadOffset'] = offset;
+    meta['uploadChunkSize'] = chunkSize;
+    final end = offset + chunkSize < size ? offset + chunkSize : size;
+    meta['uploadComplete'] = end == size;
+    final next = task.copyWith(
+      taskId: '${task.taskId}:$offset:$chunkSize:${meta['uploadAttempts']}',
+      url: (meta['uploadUrl'] as String?) ?? task.url,
+      httpRequestMethod: offset == 0 ? 'POST' : 'PATCH',
+      post: 'binary',
+      fields: const {},
+      headers: _rufhHeaders(
+        offset: offset,
+        end: end,
+        size: size,
+        checksum: meta['uploadChecksum'] as String,
+        assetData: meta['uploadAssetData'] as String,
+        baseHeaders: ApiService.getRequestHeaders(),
+      ),
+      metaData: json.encode(meta),
+      retries: 0,
+    );
+    await enqueueTasks([next]);
+  }
+
+  UploadTask _rufhUploadTask({
+    required int fileLength,
+    required int chunkSize,
+    required String checksum,
+    required int offset,
+    required String url,
+    required BaseDirectory baseDirectory,
+    required String directory,
+    required String filename,
+    required String? originalFileName,
+    required String? deviceAssetId,
+    required String? metadata,
+    required String group,
+    required int? priority,
+    required bool requiresWiFi,
+    required Map<String, String> fields,
+  }) {
+    final end = chunkSize < fileLength ? chunkSize : fileLength;
+    final assetData = _assetData(fields);
+    final meta = metadata == null || metadata.isEmpty
+        ? <String, dynamic>{}
+        : Map<String, dynamic>.from(json.decode(metadata) as Map);
+    meta.addAll({
+      'uploadPhase': 'rufh',
+      'uploadOffset': offset,
+      'uploadSize': fileLength,
+      'uploadChunkSize': chunkSize,
+      'uploadChecksum': checksum,
+      'uploadAssetData': assetData,
+      'uploadAttempts': 0,
+      'uploadComplete': end == fileLength,
+      'uploadUrl': url,
+    });
+
+    return UploadTask(
+      taskId: '${deviceAssetId ?? filename}:$offset',
+      displayName: originalFileName ?? filename,
+      httpRequestMethod: 'POST',
+      post: 'binary',
+      url: url,
+      headers: _rufhHeaders(
+        offset: offset,
+        end: end,
+        size: fileLength,
+        checksum: checksum,
+        assetData: assetData,
+        baseHeaders: ApiService.getRequestHeaders(),
+      ),
+      filename: filename,
+      fields: const {},
+      baseDirectory: baseDirectory,
+      directory: directory,
+      metaData: json.encode(meta),
+      group: group,
+      requiresWiFi: requiresWiFi,
+      priority: priority ?? 5,
+      updates: Updates.statusAndProgress,
+      retries: 0,
+    );
+  }
+
+  Map<String, String> _rufhHeaders({
+    required int offset,
+    required int end,
+    required int size,
+    required String checksum,
+    required String assetData,
+    required Map<String, String> baseHeaders,
+  }) {
+    final headers = <String, String>{
+      ...baseHeaders,
+      'Range': 'bytes=$offset-${end - 1}',
+      'Content-Type': offset == 0 ? 'application/octet-stream' : 'application/partial-upload',
+      'Content-Disposition': '',
+      'Upload-Draft-Interop-Version': '6',
+      'Upload-Complete': end == size ? '?1' : '?0',
+      'Upload-Length': '$size',
+    };
+    if (offset == 0) {
+      headers['Repr-Digest'] = 'sha=:$checksum:';
+      headers['x-immich-asset-data'] = assetData;
+    } else {
+      headers['Upload-Offset'] = '$offset';
+    }
+    return headers;
+  }
+
+  String _assetData(Map<String, String> fields) {
+    String quote(String value) => '"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"';
+    final created = fields['fileCreatedAt'] ?? DateTime.now().toUtc().toIso8601String();
+    final modified = fields['fileModifiedAt'] ?? created;
+    final parts = <String>[
+      'device-asset-id=${quote(fields['deviceAssetId'] ?? fields['filename'] ?? 'asset')}',
+      'device-id=${quote(fields['deviceId'] ?? 'mobile')}',
+      'filename=${quote(fields['filename'] ?? 'asset')}',
+      'file-created-at=${quote(created)}',
+      'file-modified-at=${quote(modified)}',
+      'is-favorite=${fields['isFavorite'] == 'true' ? '?1' : '?0'}',
+    ];
+    final livePhotoVideoId = fields['livePhotoVideoId'];
+    if (livePhotoVideoId != null && livePhotoVideoId.isNotEmpty) {
+      parts.add('live-photo-video-id=${quote(livePhotoVideoId)}');
+    }
+    final cloudId = fields['icloudId'];
+    if (cloudId != null && cloudId.isNotEmpty) {
+      parts.add('icloud-id=${quote(cloudId)}');
+    }
+    return parts.join(', ');
+  }
+
+  int? _maxAppendSize(String? header) {
+    final match = RegExp(r'(?:^|,\s*)max-append-size=(\d+)').firstMatch(header ?? '');
+    return int.tryParse(match?.group(1) ?? '');
+  }
+
+  Uri _resolveLocation(String currentUrl, String location) {
+    if (location.startsWith('http')) {
+      return Uri.parse(location);
+    }
+    if (location.startsWith('/')) {
+      return Uri.parse(currentUrl).replace(path: location);
+    }
+    return Uri.parse(currentUrl).resolve(location);
   }
 }

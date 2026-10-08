@@ -60,6 +60,14 @@ interface UploadRequestOptions {
   onUploadProgress?: (event: ProgressEvent<XMLHttpRequestEventTarget>) => void;
 }
 
+interface SendRequestOptions {
+  url: string;
+  method?: string;
+  data?: XMLHttpRequestBodyInit | null;
+  headers?: Record<string, string>;
+  onUploadProgress?: (event: ProgressEvent<XMLHttpRequestEventTarget>) => void;
+}
+
 export class AbortError extends Error {
   override name = 'AbortError';
 }
@@ -124,6 +132,61 @@ export const uploadRequest = async <T>(options: UploadRequestOptions): Promise<{
     xhr.open(options.method || 'POST', url);
     xhr.responseType = 'json';
     xhr.send(data);
+  });
+};
+
+const responseHeaders = (xhr: XMLHttpRequest) => {
+  const headers: Record<string, string> = {};
+  for (const line of xhr
+    .getAllResponseHeaders()
+    .trim()
+    .split(/[\r\n]+/)) {
+    const index = line.indexOf(':');
+    if (index > 0) {
+      headers[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
+    }
+  }
+  return headers;
+};
+
+export const sendRequest = async <T>(
+  options: SendRequestOptions,
+): Promise<{ data: T; status: number; ok: boolean; headers: Record<string, string> }> => {
+  const { onUploadProgress: onProgress, data, url, headers, method } = options;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const unsubscribe = trackUpload(() => xhr.abort());
+
+    xhr.addEventListener('error', () => {
+      unsubscribe();
+      reject(new TypeError('Network request failed'));
+    });
+
+    xhr.addEventListener('abort', () => {
+      unsubscribe();
+      reject(new AbortError());
+    });
+
+    xhr.addEventListener('load', () => {
+      unsubscribe();
+      resolve({
+        data: (xhr.response ?? {}) as T,
+        status: xhr.status,
+        ok: xhr.status >= 200 && xhr.status < 300,
+        headers: responseHeaders(xhr),
+      });
+    });
+
+    if (onProgress) {
+      xhr.upload.addEventListener('progress', (event) => onProgress(event));
+    }
+
+    xhr.open(method || 'POST', url);
+    xhr.responseType = 'json';
+    for (const [key, value] of Object.entries(headers ?? {})) {
+      xhr.setRequestHeader(key, value);
+    }
+    xhr.send(data ?? null);
   });
 };
 

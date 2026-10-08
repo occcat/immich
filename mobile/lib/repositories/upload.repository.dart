@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:background_downloader/background_downloader.dart';
+import 'package:crypto/crypto.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart';
 import 'package:immich_mobile/constants/constants.dart';
@@ -12,6 +13,8 @@ import 'package:immich_mobile/infrastructure/repositories/network.repository.dar
 import 'package:logging/logging.dart';
 
 final uploadRepositoryProvider = Provider((ref) => UploadRepository());
+
+const int kUploadChunkFloorBytes = 5 * 1024 * 1024;
 
 class UploadRepository {
   final Logger logger = Logger('UploadRepository');
@@ -64,9 +67,28 @@ class UploadRepository {
     required Completer<void>? cancelToken,
     void Function(int bytes, int totalBytes)? onProgress,
     required String logContext,
+    String? checksum,
     Client? httpClient,
   }) async {
     final String savedEndpoint = Store.get(StoreKey.serverEndpoint);
+    final length = _fileLength(file);
+    if (length != null && length > kUploadChunkFloorBytes) {
+      final chunked = await _uploadWithRufh(
+        file: file,
+        length: length,
+        originalFileName: originalFileName,
+        fields: fields,
+        checksum: checksum,
+        endpoint: savedEndpoint,
+        cancelToken: cancelToken,
+        onProgress: onProgress,
+        logContext: logContext,
+        httpClient: httpClient,
+      );
+      if (chunked != null) {
+        return chunked;
+      }
+    }
 
     ProgressMultipartRequest buildRequest() {
       final request = ProgressMultipartRequest(
@@ -127,6 +149,247 @@ class UploadRepository {
       logger.warning("Error uploading $logContext: $error: $stackTrace");
       return UploadResult.error(errorMessage: error.toString());
     }
+  }
+
+  Future<int?> maxAppendBytes({Client? httpClient}) async {
+    final endpoint = Store.get(StoreKey.serverEndpoint);
+    final client = httpClient ?? NetworkRepository.client;
+    try {
+      final response = await client.send(Request('OPTIONS', Uri.parse('$endpoint/upload')));
+      final body = await response.stream.bytesToString();
+      if (response.statusCode == 404 || response.statusCode == 405) {
+        return null;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        logger.warning('Upload options failed: ${response.statusCode} $body');
+        return null;
+      }
+      return _maxAppendSize(response.headers['upload-limit']);
+    } catch (error) {
+      logger.warning('Upload options request failed: $error');
+      return null;
+    }
+  }
+
+  int? _fileLength(File file) {
+    try {
+      return file.lengthSync();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int? _maxAppendSize(String? header) {
+    if (header == null) {
+      return null;
+    }
+    final match = RegExp(r'(?:^|,\s*)max-append-size=(\d+)').firstMatch(header);
+    final limit = int.tryParse(match?.group(1) ?? '');
+    if (limit == null || limit <= 0) {
+      return null;
+    }
+    return limit;
+  }
+
+  String _quoteStructured(String value) => '"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"';
+
+  Future<String> _checksumBase64(File file, String? checksum) async {
+    if (checksum != null && RegExp(r'^[0-9a-fA-F]{40}$').hasMatch(checksum)) {
+      final bytes = List<int>.generate(
+        20,
+        (index) => int.parse(checksum.substring(index * 2, index * 2 + 2), radix: 16),
+      );
+      return base64Encode(bytes);
+    }
+    if (checksum != null && checksum.isNotEmpty) {
+      return checksum;
+    }
+    final digest = await sha1.bind(file.openRead()).first;
+    return base64Encode(digest.bytes);
+  }
+
+  String _assetDataHeader(Map<String, String> fields, String filename) {
+    final created = fields['fileCreatedAt'] ?? DateTime.now().toUtc().toIso8601String();
+    final modified = fields['fileModifiedAt'] ?? created;
+    final parts = <String>[
+      'device-asset-id=${_quoteStructured(fields['deviceAssetId'] ?? filename)}',
+      'device-id=${_quoteStructured(fields['deviceId'] ?? 'mobile')}',
+      'filename=${_quoteStructured(filename)}',
+      'file-created-at=${_quoteStructured(created)}',
+      'file-modified-at=${_quoteStructured(modified)}',
+      'is-favorite=${fields['isFavorite'] == 'true' ? '?1' : '?0'}',
+    ];
+    final livePhotoVideoId = fields['livePhotoVideoId'];
+    if (livePhotoVideoId != null && livePhotoVideoId.isNotEmpty) {
+      parts.add('live-photo-video-id=${_quoteStructured(livePhotoVideoId)}');
+    }
+    final icloudId = fields['icloudId'] ?? _icloudIdFromMetadata(fields['metadata']);
+    if (icloudId != null && icloudId.isNotEmpty) {
+      parts.add('icloud-id=${_quoteStructured(icloudId)}');
+    }
+    return parts.join(', ');
+  }
+
+  String? _icloudIdFromMetadata(String? metadata) {
+    if (metadata == null || metadata.isEmpty) {
+      return null;
+    }
+    try {
+      final decoded = jsonDecode(metadata);
+      if (decoded is! List) {
+        return null;
+      }
+      for (final item in decoded) {
+        if (item is Map && item['value'] is Map) {
+          final cloudId = (item['value'] as Map)['iCloudId'];
+          if (cloudId is String && cloudId.isNotEmpty) {
+            return cloudId;
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Returns null when this server has no resumable upload limit below the file size.
+  Future<UploadResult?> _uploadWithRufh({
+    required File file,
+    required int length,
+    required String originalFileName,
+    required Map<String, String> fields,
+    required String? checksum,
+    required String endpoint,
+    required Completer<void>? cancelToken,
+    required void Function(int bytes, int totalBytes)? onProgress,
+    required String logContext,
+    required Client? httpClient,
+  }) async {
+    final client = httpClient ?? NetworkRepository.client;
+    final limit = await maxAppendBytes(httpClient: client);
+    if (limit == null || length <= limit) {
+      return null;
+    }
+
+    var chunkSize = limit;
+    var offset = 0;
+    var url = Uri.parse('$endpoint/upload');
+    var stalls = 0;
+    final digest = await _checksumBase64(file, checksum);
+    final assetData = _assetDataHeader(fields, originalFileName);
+
+    while (offset < length) {
+      if (cancelToken?.isCompleted == true) {
+        return UploadResult.cancelled();
+      }
+
+      final sliceLength = chunkSize < length - offset ? chunkSize : length - offset;
+      final complete = offset + sliceLength == length;
+      final headers = <String, String>{
+        'content-type': offset == 0 ? 'application/octet-stream' : 'application/partial-upload',
+        'upload-draft-interop-version': '6',
+        'upload-complete': complete ? '?1' : '?0',
+        'upload-length': '$length',
+      };
+      if (offset == 0) {
+        headers['repr-digest'] = 'sha=:$digest:';
+        headers['x-immich-asset-data'] = assetData;
+      } else {
+        headers['upload-offset'] = '$offset';
+      }
+
+      final request = StreamedRequest(offset == 0 ? 'POST' : 'PATCH', url);
+      request.headers.addAll(headers);
+      request.contentLength = sliceLength;
+      var sent = 0;
+      final subscription = file.openRead(offset, offset + sliceLength).listen(
+        (chunk) {
+          sent += chunk.length;
+          onProgress?.call(offset + sent, length);
+          request.sink.add(chunk);
+        },
+        onError: request.sink.addError,
+        onDone: request.sink.close,
+        cancelOnError: true,
+      );
+      cancelToken?.future.then((_) {
+        subscription.cancel();
+        request.sink.close();
+      });
+
+      StreamedResponse response;
+      try {
+        response = await client.send(request);
+      } on RequestAbortedException {
+        return UploadResult.cancelled();
+      } catch (error) {
+        await subscription.cancel();
+        stalls += 1;
+        if (stalls > 5) {
+          return UploadResult.error(errorMessage: 'Upload $logContext failed: $error');
+        }
+        continue;
+      }
+
+      final body = await response.stream.bytesToString();
+      if (response.statusCode == 413) {
+        final serverMax = _maxAppendSize(response.headers['upload-limit']);
+        final halved = chunkSize ~/ 2 < kUploadChunkFloorBytes ? kUploadChunkFloorBytes : chunkSize ~/ 2;
+        final next = serverMax != null && serverMax < chunkSize ? serverMax : halved;
+        if (next >= sliceLength) {
+          return UploadResult.error(statusCode: 413, errorMessage: 'Upload chunk exceeds the server limit');
+        }
+        chunkSize = next;
+        continue;
+      }
+
+      if (response.statusCode == 409) {
+        final serverOffset = int.tryParse(response.headers['upload-offset'] ?? '');
+        if (serverOffset == null || serverOffset == offset) {
+          stalls += 1;
+          if (stalls > 5) {
+            return UploadResult.error(statusCode: 409, errorMessage: body);
+          }
+          continue;
+        }
+        offset = serverOffset;
+        stalls = 0;
+        continue;
+      }
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return UploadResult.error(statusCode: response.statusCode, errorMessage: body.isEmpty ? 'Upload failed' : body);
+      }
+
+      stalls = 0;
+      onProgress?.call(offset + sliceLength, length);
+      if (complete || response.statusCode == 200) {
+        try {
+          final json = jsonDecode(body) as Map<String, dynamic>;
+          return UploadResult.success(remoteAssetId: json['id'] as String);
+        } catch (_) {
+          return UploadResult.error(errorMessage: 'Failed to parse server response');
+        }
+      }
+
+      final location = response.headers['location'];
+      if (offset == 0 && location != null && location.isNotEmpty) {
+        url = _resolveLocation(endpoint, location);
+      }
+      final serverOffset = int.tryParse(response.headers['upload-offset'] ?? '');
+      offset = serverOffset ?? offset + sliceLength;
+    }
+
+    return UploadResult.error(errorMessage: 'Upload did not finish');
+  }
+
+  Uri _resolveLocation(String endpoint, String location) {
+    if (location.startsWith('http')) {
+      return Uri.parse(location);
+    }
+    if (location.startsWith('/')) {
+      return Uri.parse(endpoint).replace(path: location);
+    }
+    return Uri.parse(endpoint).resolve(location);
   }
 }
 
